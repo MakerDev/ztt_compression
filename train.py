@@ -15,6 +15,7 @@ from datetime import datetime
 
 # Import our LlamaComp implementation
 from models.llama.LLaMaComp import LlamaCompForCausalLM, LlamaCompConfig
+from mmlu_debugger import analyze_lora_parameters
 
 
 CFG_PRESETS = {
@@ -30,7 +31,7 @@ CFG_PRESETS = {
 
         # ────────── LoRA ──────────
         "use_lora": True,
-        "train_all": False,
+        "train_all": True,
         "lora_rank": 32,
         "lora_alpha": 16.0,
         "lora_dropout": 0.1,
@@ -293,6 +294,8 @@ def main():
                 param.requires_grad = True
                 print(f"  Training: {name}")
     
+    analyze_lora_parameters(model)
+
     # Prepare dataset
     train_dataset = prepare_mmlu_dataset(tokenizer, args.max_seq_length)
 

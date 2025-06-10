@@ -9,6 +9,78 @@ from transformers import AutoTokenizer
 import json
 
 
+def analyze_lora_parameters(model):
+    """
+    Analyze LoRA parameter distribution and memory usage in a LlamaComp model.
+    
+    Args:
+        model: LlamaCompForCausalLM instance
+    
+    Returns:
+        dict: Analysis results including parameter counts and memory usage
+    """
+    analysis = {
+        'lora_params_by_layer': {},
+        'base_params_by_layer': {},
+        'total_lora_params': 0,
+        'total_base_params': 0,
+        'total_params': 0,
+        'lora_memory_mb': 0,
+        'base_memory_mb': 0,
+        'total_memory_mb': 0,
+        'lora_ratio': 0,
+    }
+    
+    # Analyze each layer
+    for layer_idx, layer in enumerate(model.model.layers):
+        layer_lora_params = 0
+        layer_base_params = 0
+        
+        # Count parameters in this layer
+        for name, param in layer.named_parameters():
+            param_count = param.numel()
+            if 'lora_' in name:
+                layer_lora_params += param_count
+                analysis['total_lora_params'] += param_count
+            else:
+                layer_base_params += param_count
+                analysis['total_base_params'] += param_count
+        
+        analysis['lora_params_by_layer'][layer_idx] = layer_lora_params
+        analysis['base_params_by_layer'][layer_idx] = layer_base_params
+    
+    # Count other model parameters (embeddings, LM head, etc.)
+    for name, param in model.named_parameters():
+        if not any(f'layers.{i}.' in name for i in range(len(model.model.layers))):
+            param_count = param.numel()
+            if 'lora_' in name:
+                analysis['total_lora_params'] += param_count
+            else:
+                analysis['total_base_params'] += param_count
+    
+    # Calculate totals
+    analysis['total_params'] = analysis['total_lora_params'] + analysis['total_base_params']
+    
+    # Calculate memory usage (assuming float16)
+    bytes_per_param = 2  # 2 bytes for float16
+    analysis['lora_memory_mb'] = (analysis['total_lora_params'] * bytes_per_param) / (1024 * 1024)
+    analysis['base_memory_mb'] = (analysis['total_base_params'] * bytes_per_param) / (1024 * 1024)
+    analysis['total_memory_mb'] = (analysis['total_params'] * bytes_per_param) / (1024 * 1024)
+    
+    # Calculate ratio
+    if analysis['total_params'] > 0:
+        analysis['lora_ratio'] = analysis['total_lora_params'] / analysis['total_params']
+    
+    print(f"Total LoRA parameters: {analysis['total_lora_params']}"
+          f" ({analysis['lora_memory_mb']:.2f} MB)"
+          f" ({analysis['lora_ratio']:.2%} of total)"
+          f" across {len(analysis['lora_params_by_layer'])} layers"
+          f" with {len(model.model.layers)} layers in total"
+          f" ({analysis['total_memory_mb']:.2f} MB)")
+
+    return analysis
+
+
 class MMLUDebugger:
     """Debug and analyze MMLU training issues"""
     
