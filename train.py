@@ -4,12 +4,14 @@ warnings.filterwarnings("ignore")
 import os
 import torch
 import torch.nn as nn
+import argparse
+import yaml
+
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainingArguments
 from trl import SFTConfig, SFTTrainer
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-import argparse
 from copy import deepcopy
 from datetime import datetime
 
@@ -17,123 +19,82 @@ from datetime import datetime
 from models.llama.LLaMaComp import LlamaCompForCausalLM, LlamaCompConfig
 from mmlu_debugger import analyze_lora_parameters
 
+def parse_args():
+    # 1) 초기 파서: config 파일 경로와 preset 이름만
+    init_parser = argparse.ArgumentParser(add_help=False)
+    init_parser.add_argument(
+        "--config_file", "-c",
+        type=str, default="/data/ztt_compression/configs.yaml",
+        help="Path to YAML config"
+    )
+    init_parser.add_argument(
+        "--preset", "-p",
+        type=str, default="llama_3b_cycle7",
+        help="Which preset to use from YAML"
+    )
+    init_args, remaining_argv = init_parser.parse_known_args()
 
-CFG_PRESETS = {
-    "prn_cyc_distill": {
-        # ────────── 모델 ──────────
-        "model_name": "meta-llama/Llama-3.2-1B-Instruct",
-        "output_dir": "/data/save_files/llama-comp-mmlu",
-
-        # ────────── 프루닝 / 사이클링 ──────────
-        "pruned_layers": [10, 11, 12, 13, 15],
-        "cycle_layers": [5, 6, 7, 8, 9],
-        "cycle_count": 2,
-
-        # ────────── LoRA ──────────
-        "use_lora": True,
-        "train_all": True,
-        "lora_rank": 32,
-        "lora_alpha": 16.0,
-        "lora_dropout": 0.1,
-
-        # ────────── distillation ──────────
-        "use_distillation": False,
-        "distillation_temperature": 3.0,
-        "distillation_alpha": 0.5,
-
-        # ────────── 학습 ──────────
-        "batch_size": 4,
-        "gradient_accumulation_steps": 16,
-        "learning_rate": 2e-4,
-        "num_epochs": 1,
-        "max_seq_length": 1536,
-        "warmup_steps": 50,
-    },
-    "base": {  # 기본 프리셋
-        # ────────── 모델 ──────────
-        "model_name": "meta-llama/Llama-3.2-1B",
-        "output_dir": "/data/save_files/llama-comp-mmlu",
-
-        # ────────── 프루닝 / 사이클링 ──────────
-        "pruned_layers": None,
-        "cycle_layers": None,
-        "cycle_count": 2,
-
-        # ────────── LoRA ──────────
-        "use_lora": True,
-        "lora_rank": 8,
-        "lora_alpha": 16.0,
-        "lora_dropout": 0.1,
-
-        # ────────── distillation ──────────
-        "use_distillation": False,
-        "distillation_temperature": 3.0,
-        "distillation_alpha": 0.5,
-
-        # ────────── 학습 ──────────
-        "batch_size": 8,
-        "gradient_accumulation_steps": 8,
-        "learning_rate": 2e-4,
-        "num_epochs": 1,
-        "max_seq_length": 1536,
-        "warmup_steps": 50,
-    },
-}
-
-def parse_args(cfg_name: str = "prn_cyc_distill"):
-    base_cfg = deepcopy(CFG_PRESETS["base"])
-    base_cfg.update(CFG_PRESETS.get(cfg_name, {}))
+    # 2) YAML 로드 & preset 병합
+    with open(init_args.config_file, "r") as f:
+        yaml_cfg = yaml.safe_load(f)
+        
+    preset_cfg  = yaml_cfg.get(init_args.preset, {})
+    cfg = {**preset_cfg}  # base 위에 preset 덮어쓰기
 
     parser = argparse.ArgumentParser(
+        parents=[init_parser],
         description="Fine-tune LlamaComp on MMLU dataset",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
     # ────────── 모델 ──────────
-    parser.add_argument("--model_name", type=str,      default=base_cfg["model_name"])
-    parser.add_argument("--output_dir", type=str,      default=base_cfg["output_dir"])
+    parser.add_argument("--model_name",   type=str, default=cfg["model_name"])
+    parser.add_argument("--output_dir",   type=str, default=cfg["output_dir"])
 
     # ────────── 프루닝 ──────────
     parser.add_argument("--pruned_layers", type=int, nargs="+",
-                        default=base_cfg["pruned_layers"])
+                        default=cfg.get("pruned_layers"))
 
     # ────────── 사이클링 ──────────
     parser.add_argument("--cycle_layers", type=int, nargs="+",
-                        default=base_cfg["cycle_layers"])
-    parser.add_argument("--cycle_count", type=int,     default=base_cfg["cycle_count"])
+                        default=cfg.get("cycle_layers"))
+    parser.add_argument("--cycle_count",  type=int,
+                        default=cfg.get("cycle_count"))
 
     # ────────── LoRA ──────────
-    parser.add_argument("--use_lora", 
-                        default=base_cfg["use_lora"])
-    parser.add_argument("--train_all", 
-                        default=base_cfg["train_all"])
-    parser.add_argument("--lora_rank",     type=int,   default=base_cfg["lora_rank"])
-    parser.add_argument("--lora_alpha",    type=float, default=base_cfg["lora_alpha"])
-    parser.add_argument("--lora_dropout",  type=float, default=base_cfg["lora_dropout"])
+    parser.add_argument("--use_lora",      action="store_true" if cfg["use_lora"] else "store_false",
+                        default=cfg["use_lora"])
+    parser.add_argument("--lora_rank",     type=int,   default=cfg["lora_rank"])
+    parser.add_argument("--lora_alpha",    type=float, default=cfg["lora_alpha"])
+    parser.add_argument("--lora_dropout",  type=float, default=cfg["lora_dropout"])
+    parser.add_argument("--train_all",     action="store_true" if cfg["train_all"] else "store_false",
+                        default=cfg["train_all"])
 
     # ────────── Distillation ──────────
     parser.add_argument("--use_distillation",
-                        default=base_cfg["use_distillation"])
+                        action="store_true" if cfg["use_distillation"] else "store_false",
+                        default=cfg["use_distillation"])
     parser.add_argument("--distillation_temperature", type=float,
-                        default=base_cfg["distillation_temperature"])
+                        default=cfg["distillation_temperature"])
     parser.add_argument("--distillation_alpha", type=float,
-                        default=base_cfg["distillation_alpha"])
+                        default=cfg["distillation_alpha"])
 
     # ────────── 학습 ──────────
     parser.add_argument("--batch_size",                  type=int,
-                        default=base_cfg["batch_size"])
+                        default=cfg["batch_size"])
     parser.add_argument("--gradient_accumulation_steps", type=int,
-                        default=base_cfg["gradient_accumulation_steps"])
+                        default=cfg["gradient_accumulation_steps"])
     parser.add_argument("--learning_rate",               type=float,
-                        default=base_cfg["learning_rate"])
+                        default=cfg["learning_rate"])
     parser.add_argument("--num_epochs",                  type=float,
-                        default=base_cfg["num_epochs"])
+                        default=cfg["num_epochs"])
     parser.add_argument("--max_seq_length",              type=int,
-                        default=base_cfg["max_seq_length"])
+                        default=cfg["max_seq_length"])
     parser.add_argument("--warmup_steps",                type=int,
-                        default=base_cfg["warmup_steps"])
+                        default=cfg["warmup_steps"])
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="GPU index to use (default: 0)")
 
-    # (2) CLI 인자가 있으면 최종적으로 덮어쓰기
     return parser.parse_args()
 
 
