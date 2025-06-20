@@ -46,6 +46,7 @@ class LlamaCompConfig(LlamaConfig):
     
     # LoRA configuration
     use_lora: bool = False
+    lora_all: bool = False  # Apply LoRA to all layers when True, else only to cycled layers
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.1
@@ -210,7 +211,7 @@ class LlamaCompDecoderLayer(nn.Module):
                 cycle_adapters = self._create_lora_adapters(self.config, self.base_layer)
                 
                 self.lora_adapters[f"cycle_{cycle}"] = nn.ModuleDict(cycle_adapters)
-        else:
+        elif self.config.lora_all:
             adapters = self._create_lora_adapters(self.config, self.base_layer)
             self.lora_adapters["default"] = nn.ModuleDict(adapters)
         
@@ -237,23 +238,35 @@ class LlamaCompDecoderLayer(nn.Module):
             self._init_lora_adapters()
         
         # Store original projections if using LoRA
-        if self.config.use_lora and cycle_idx is not None and f"cycle_{cycle_idx}" in self.lora_adapters:
-            orig_q_proj = self.base_layer.self_attn.q_proj.forward
-            orig_k_proj = self.base_layer.self_attn.k_proj.forward
-            orig_v_proj = self.base_layer.self_attn.v_proj.forward
-            orig_o_proj = self.base_layer.self_attn.o_proj.forward
+        if self.config.use_lora:
+            # Determine which LoRA adapters to use
+            if cycle_idx is not None and f"cycle_{cycle_idx}" in self.lora_adapters:
+                # Use cycle-specific adapters
+                lora_key = f"cycle_{cycle_idx}"
+            elif cycle_idx is None and "default" in self.lora_adapters:
+                # Use default adapters for non-cycled layers
+                lora_key = "default"
+            else:
+                # No applicable LoRA adapters
+                lora_key = None
             
-            cycle_adapters = self.lora_adapters[f"cycle_{cycle_idx}"]
-            
-            # Wrap projections with LoRA
-            if "q_proj" in cycle_adapters:
-                self.base_layer.self_attn.q_proj.forward = lambda x: orig_q_proj(x) + cycle_adapters["q_proj"](x)
-            if "k_proj" in cycle_adapters:
-                self.base_layer.self_attn.k_proj.forward = lambda x: orig_k_proj(x) + cycle_adapters["k_proj"](x)
-            if "v_proj" in cycle_adapters:
-                self.base_layer.self_attn.v_proj.forward = lambda x: orig_v_proj(x) + cycle_adapters["v_proj"](x)
-            if "o_proj" in cycle_adapters:
-                self.base_layer.self_attn.o_proj.forward = lambda x: orig_o_proj(x) + cycle_adapters["o_proj"](x)
+            if lora_key is not None:
+                orig_q_proj = self.base_layer.self_attn.q_proj.forward
+                orig_k_proj = self.base_layer.self_attn.k_proj.forward
+                orig_v_proj = self.base_layer.self_attn.v_proj.forward
+                orig_o_proj = self.base_layer.self_attn.o_proj.forward
+                
+                adapters = self.lora_adapters[lora_key]
+                
+                # Wrap projections with LoRA
+                if "q_proj" in adapters:
+                    self.base_layer.self_attn.q_proj.forward = lambda x: orig_q_proj(x) + adapters["q_proj"](x)
+                if "k_proj" in adapters:
+                    self.base_layer.self_attn.k_proj.forward = lambda x: orig_k_proj(x) + adapters["k_proj"](x)
+                if "v_proj" in adapters:
+                    self.base_layer.self_attn.v_proj.forward = lambda x: orig_v_proj(x) + adapters["v_proj"](x)
+                if "o_proj" in adapters:
+                    self.base_layer.self_attn.o_proj.forward = lambda x: orig_o_proj(x) + adapters["o_proj"](x)
         
         # For cycled layers, we need to handle the past_key_value differently
         # to avoid cache conflicts between cycles
@@ -276,14 +289,13 @@ class LlamaCompDecoderLayer(nn.Module):
         )
         
         # Restore original projections if LoRA was applied
-        if self.config.use_lora and cycle_idx is not None and f"cycle_{cycle_idx}" in self.lora_adapters:
+        if self.config.use_lora and 'lora_key' in locals() and lora_key is not None:
             self.base_layer.self_attn.q_proj.forward = orig_q_proj
             self.base_layer.self_attn.k_proj.forward = orig_k_proj
             self.base_layer.self_attn.v_proj.forward = orig_v_proj
             self.base_layer.self_attn.o_proj.forward = orig_o_proj
         
         return outputs
-
 
 class LlamaCompModel(LlamaPreTrainedModel):
     """LlamaComp model with layer pruning, cycling, and LoRA support"""
@@ -590,7 +602,7 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
         # Freeze teacher model
         for param in self.teacher_model.parameters():
             param.requires_grad = False
-    
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
     
@@ -618,7 +630,6 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -645,7 +656,7 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
         # Compute logits in chunks to avoid OOM
         if self.training and labels is not None:
             # Process in smaller chunks for memory efficiency
-            chunk_size = 512  # Adjust based on your GPU memory
+            chunk_size = 128  # Adjust based on your GPU memory
             num_chunks = (hidden_states.shape[1] + chunk_size - 1) // chunk_size
             
             loss = 0.0
@@ -702,7 +713,7 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
                     )
                     teacher_logits = teacher_outputs.logits
                     teacher_hidden_states = teacher_outputs.hidden_states
-                
+
                 # KL divergence loss for logits (process in chunks)
                 distill_loss = 0.0
                 for i in range(num_chunks):
@@ -891,6 +902,7 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
         cycle_count = kwargs.pop("cycle_count", 1)
         use_lora = kwargs.pop("use_lora", False)
         lora_rank = kwargs.pop("lora_rank", 8)
+        lora_all = kwargs.pop("lora_all", False)
         lora_alpha = kwargs.pop("lora_alpha", 16.0)
         lora_dropout = kwargs.pop("lora_dropout", 0.1)
         target_module_default = ["q_proj", "v_proj", "k_proj", "o_proj"] if use_lora else None
@@ -907,6 +919,7 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
         config.cycle_layers = cycle_layers
         config.cycle_count = cycle_count
         config.use_lora = use_lora
+        config.lora_all = lora_all
         config.lora_rank = lora_rank
         config.lora_alpha = lora_alpha
         config.lora_dropout = lora_dropout

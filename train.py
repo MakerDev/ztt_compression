@@ -2,22 +2,31 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import torch
 import torch.nn as nn
 import argparse
 import yaml
 
 from datasets import load_dataset
-from transformers import AutoTokenizer, TrainingArguments
+from transformers import AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from copy import deepcopy
 from datetime import datetime
 
 # Import our LlamaComp implementation
-from models.llama.LLaMaComp import LlamaCompForCausalLM, LlamaCompConfig
+from models.llama.LLaMaComp import LlamaCompForCausalLM
 from mmlu_debugger import analyze_lora_parameters
+from deepspeed.runtime.zero.stage3 import estimate_zero3_model_states_mem_needs_all_live
+
+def collate_fn(batch):
+    return {
+        'question': [item['question'] for item in batch],
+        'choices': [item['choices'] for item in batch],
+        'answer': torch.tensor([item['answer'] for item in batch]),
+        'subject': [item['subject'] for item in batch]
+    }
 
 def parse_args():
     # 1) 초기 파서: config 파일 경로와 preset 이름만
@@ -29,7 +38,7 @@ def parse_args():
     )
     init_parser.add_argument(
         "--preset", "-p",
-        type=str, default="llama_3b_cycle7",
+        type=str, default="llama_1b_cycle5",
         help="Which preset to use from YAML"
     )
     init_args, remaining_argv = init_parser.parse_known_args()
@@ -64,6 +73,8 @@ def parse_args():
     # ────────── LoRA ──────────
     parser.add_argument("--use_lora",      action="store_true" if cfg["use_lora"] else "store_false",
                         default=cfg["use_lora"])
+    parser.add_argument("--lora_all",      action="store_true" if cfg["lora_all"] else "store_false",
+                        default=cfg["lora_all"])
     parser.add_argument("--lora_rank",     type=int,   default=cfg["lora_rank"])
     parser.add_argument("--lora_alpha",    type=float, default=cfg["lora_alpha"])
     parser.add_argument("--lora_dropout",  type=float, default=cfg["lora_dropout"])
@@ -181,7 +192,7 @@ def evaluate_mmlu_accuracy(model, tokenizer, dataloader, device="cuda"):
     total = 0
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch in tqdm(dataloader, desc="Evaluating", dynamic_ncols=True):
             for q, choices, ans in zip(batch['question'], batch['choices'], batch['answer']):
                 # Format prompt without answer
                 prompt = format_mmlu_prompt(q, choices)
@@ -221,6 +232,7 @@ def main():
         cycle_layers=args.cycle_layers,
         cycle_count=args.cycle_count,
         use_lora=args.use_lora,
+        lora_all=args.lora_all,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
@@ -239,13 +251,16 @@ def main():
     print(f"- Cycle count: {args.cycle_count}")
     print(f"- Execution sequence length: {len(model.model.execution_sequence)}")
     print(f"- Using LoRA: {args.use_lora}")
+    print(f"- LoRA Rank: {args.lora_rank}")
+    print(f"- LoRA Alpha: {args.lora_alpha}")
+    print(f"- LoRA to ALL: {args.lora_all}")
     print(f"- Using Distillation: {args.use_distillation}")
-    
+    print(f"- Train All: {args.train_all}")
+
     # Prepare for training - only train LoRA parameters if enabled
     if args.use_lora:
         print("\nSetting up LoRA training...")
         # Freeze all base parameters
-        print(f"Train All: {args.train_all}")
         for param in model.parameters():
             param.requires_grad = args.train_all
 
@@ -253,7 +268,7 @@ def main():
         for name, param in model.named_parameters():
             if "lora_" in name:
                 param.requires_grad = True
-                print(f"  Training: {name}")
+                # print(f"  Training: {name}")
     
     analyze_lora_parameters(model)
 
@@ -284,6 +299,8 @@ def main():
         f.write(f"Max Sequence Length: {args.max_seq_length}\n")
         f.write(f"Warmup Steps: {args.warmup_steps}\n")
 
+    estimate_zero3_model_states_mem_needs_all_live(model, num_gpus_per_node=2, num_nodes=1)
+
     # Training configuration
     training_args = SFTConfig(
         output_dir=args.output_dir,
@@ -305,11 +322,14 @@ def main():
         packing=False,
         dataset_text_field="text",
         logging_steps=100,
-        gradient_checkpointing=False,
+        # gradient_checkpointing=True,
+        # gradient_checkpointing_kwargs={"use_reentrant": False},
         save_safetensors=True,
         report_to=["tensorboard"],
     )
-    
+    # model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+
     # Create trainer
     trainer = LlamaCompTrainer(
         model=model,
@@ -323,13 +343,7 @@ def main():
     mmlu_test = load_dataset("cais/mmlu", "all", split="test")
     
     # Create test dataloader
-    def collate_fn(batch):
-        return {
-            'question': [item['question'] for item in batch],
-            'choices': [item['choices'] for item in batch],
-            'answer': torch.tensor([item['answer'] for item in batch]),
-            'subject': [item['subject'] for item in batch]
-        }
+
     
     test_dataloader = DataLoader(
         mmlu_test,
@@ -354,6 +368,9 @@ def main():
     print(f"\nSaving final model to {args.output_dir}/final_model")
     model.save_pretrained(f"{args.output_dir}/final_model")
     tokenizer.save_pretrained(f"{args.output_dir}/final_model")
+    
+    # model.gradient_checkpointing_disable()
+    # model.config.use_cache = True  # Re-enable cache after training
     
     # Evaluate after training
     print("\n=== Evaluating on MMLU test set (after training) ===")
