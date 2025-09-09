@@ -12,6 +12,7 @@ from transformers.modeling_utils import PretrainedConfig
 from transformers.utils import logging
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.processing_utils import Unpack
+from transformers.generation import GenerationMixin, GenerationConfig
 
 # Import the original Llama components
 from transformers.models.llama.modeling_llama import (
@@ -91,9 +92,6 @@ class LoRALayer(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A.weight, a=torch.sqrt(torch.tensor(5.0)).item())
         nn.init.zeros_(self.lora_B.weight)
         
-    # def forward(self, x: torch.Tensor) -> torch.Tensor:
-    #     """Apply LoRA adapter to input"""
-    #     return self.lora_B(self.lora_dropout(self.lora_A(x))) * self.scaling
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply LoRA adapter to input"""
         # Ensure all operations happen on the same device as input
@@ -113,6 +111,7 @@ class LoRALayer(nn.Module):
             lora_out = self.lora_B(self.lora_dropout(self.lora_A(x)))
             
         return lora_out * self.scaling
+
 
 class LlamaCompDecoderLayer(nn.Module):
     """Enhanced decoder layer with LoRA support and cycle-aware processing"""
@@ -297,6 +296,7 @@ class LlamaCompDecoderLayer(nn.Module):
         
         return outputs
 
+
 class LlamaCompModel(LlamaPreTrainedModel):
     """LlamaComp model with layer pruning, cycling, and LoRA support"""
     
@@ -353,7 +353,7 @@ class LlamaCompModel(LlamaPreTrainedModel):
             else:
                 # Normal layer, execute once
                 sequence.append((layer_idx, None))
-        
+        print(sequence)
         return sequence
     
     def get_input_embeddings(self):
@@ -579,7 +579,7 @@ class LlamaCompModel(LlamaPreTrainedModel):
         return causal_mask
 
 
-class LlamaCompForCausalLM(LlamaPreTrainedModel):
+class LlamaCompForCausalLM(GenerationMixin, LlamaPreTrainedModel):
     """LlamaComp for causal language modeling with distillation support"""
     
     _tied_weights_keys = ["lm_head.weight"]
@@ -590,6 +590,8 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
+        self.generation_config = GenerationConfig.from_model_config(config)
+
         # Store teacher model for distillation if needed
         self.teacher_model = None
         
@@ -614,6 +616,97 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
     
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+    
+    def can_generate(self) -> bool:
+        """
+        Returns True to indicate the model can be used for generation.
+        """
+        return True
+    
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        use_cache=True,
+        **kwargs,
+    ):
+        """Prepare inputs for generation step"""
+        
+        # For models with cycling, disable caching
+        if self.config.cycle_layers and self.config.cycle_count > 1:
+            use_cache = False
+            past_key_values = None
+        
+        past_length = 0
+        if past_key_values is not None:
+            # Past key values are available
+            past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
+            max_cache_length = (
+                torch.tensor(past_key_values.get_max_cache_shape(), device=input_ids.device)
+                if past_key_values.get_max_cache_shape() is not None
+                else None
+            )
+            cache_length = past_length if max_cache_length is None else torch.min(max_cache_length, past_length)
+            
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+            else:
+                remove_prefix_length = input_ids.shape[1] - 1
+                attention_mask = attention_mask[:, remove_prefix_length:]
+        
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # Create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+        
+        # If `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+        
+        input_length = position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_length, past_length + input_length, device=input_ids.device
+            )
+        else:
+            cache_position = cache_position[-input_length:]
+        
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+            }
+        )
+        return model_inputs
+    
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        """Reorder cache for beam search"""
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
 
     def forward(
         self,
@@ -788,110 +881,6 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
             attentions=outputs.attentions,
         )
 
-    def forward2(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs,
-    ) -> CausalLMOutputWithPast:
-        
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        # Get student outputs
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_layer_states=self.config.use_distillation and self.teacher_model is not None,
-            cache_position=cache_position,
-            **kwargs,
-        )
-        
-        hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
-        
-        loss = None
-        if labels is not None:
-            # Standard language modeling loss
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
-            
-            # Add distillation loss if enabled
-            if self.config.use_distillation and self.teacher_model is not None:
-                with torch.no_grad():
-                    teacher_outputs = self.teacher_model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True,
-                    )
-                    teacher_logits = teacher_outputs.logits
-                    teacher_hidden_states = teacher_outputs.hidden_states
-                
-                # KL divergence loss for logits
-                kl_loss = nn.KLDivLoss(reduction="batchmean")
-                student_log_probs = nn.functional.log_softmax(
-                    logits / self.config.distillation_temperature, dim=-1
-                )
-                teacher_probs = nn.functional.softmax(
-                    teacher_logits / self.config.distillation_temperature, dim=-1
-                )
-                distill_loss = kl_loss(student_log_probs, teacher_probs) * (
-                    self.config.distillation_temperature ** 2
-                )
-                
-                # Layer-wise distillation loss if available
-                if hasattr(outputs, 'layer_states') and teacher_hidden_states is not None:
-                    layer_loss = 0.0
-                    num_student_layers = len(outputs.layer_states)
-                    num_teacher_layers = len(teacher_hidden_states) - 1  # Exclude embedding layer
-                    
-                    # Map student layers to teacher layers
-                    for i, student_hidden in enumerate(outputs.layer_states):
-                        # Simple linear mapping
-                        teacher_idx = int(i * num_teacher_layers / num_student_layers)
-                        teacher_hidden = teacher_hidden_states[teacher_idx + 1]  # +1 to skip embeddings
-                        
-                        # MSE loss between hidden states
-                        layer_loss += nn.functional.mse_loss(student_hidden, teacher_hidden)
-                    
-                    layer_loss /= num_student_layers
-                    distill_loss += layer_loss
-                
-                # Combine losses
-                loss = (1 - self.config.distillation_alpha) * loss + self.config.distillation_alpha * distill_loss
-        
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-        
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,)
-
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """Load pretrained model with compression configuration"""
@@ -973,4 +962,3 @@ class LlamaCompForCausalLM(LlamaPreTrainedModel):
                             adapter.to(device)
         
         return self
-    

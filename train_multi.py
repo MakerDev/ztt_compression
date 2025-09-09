@@ -3,7 +3,7 @@ warnings.filterwarnings("ignore")
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 import torch.nn as nn
 import argparse
@@ -395,7 +395,7 @@ def evaluate_code_bleu(model, tokenizer, dataloader, device="cuda", max_length=5
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=max_length,
-                    temperature=0.1,
+                    # temperature=0.1,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
                     eos_token_id=tokenizer.eos_token_id
