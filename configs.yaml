@@ -48,6 +48,57 @@ llama_1b_cycle5:
   batch_size: 2
   gradient_accumulation_steps: 32
 
+gemma_1b_cycle5:
+  <<: *base_llama_1b
+  model_name: google/gemma-3-1b-it
+  output_dir: /data/save_files/llama-comp-mmlu
+  pruned_layers: [7,9,10,11,12]
+  cycle_layers: [8,13,14,15,16]
+  train_all: true
+  use_lora: false
+  lora_all: false
+  use_distillation: false
+  batch_size: 4
+  gradient_accumulation_steps: 32
+
+base_pythia_1b: &base_pythia_1b
+  model_name: EleutherAI/pythia-2.8b-deduped
+  output_dir: /data/save_files/pythia-comp-mmlu
+
+  pruned_layers: []
+  cycle_layers: []
+  cycle_count: 2
+
+  use_lora: false
+  lora_all: false
+  lora_rank: 32
+  lora_alpha: 16.0
+  lora_dropout: 0.1
+  train_all: true
+
+  use_distillation: false
+  distillation_temperature: 3.0
+  distillation_alpha: 0.5
+
+  batch_size: 4
+  gradient_accumulation_steps: 16
+  learning_rate: 2e-4
+  num_epochs: 1
+  max_seq_length: 1024
+  warmup_steps: 50
+
+
+pythia_1b_cycle5:
+  <<: *base_pythia_1b
+  pruned_layers: [19, 20, 21, 22, 23, 24, 25, 26]
+  cycle_layers: [12, 13, 14, 15, 16, 17, 18]
+  use_lora: false
+  lora_all: false
+  train_all: true
+  use_distillation: false
+  batch_size: 2
+  gradient_accumulation_steps: 32
+
 llama_3b_cycle7:
   <<: *base_llama_3b
   pruned_layers: [19, 20, 21, 22, 23, 24, 25, 26]
