@@ -11,7 +11,7 @@ This script demonstrates:
 
 import torch
 from transformers import AutoTokenizer
-from models.llama.LLaMaComp import LlamaCompForCausalLM
+from src.methods.our_scheme.LLaMaComp import LlamaCompForCausalLM
 
 
 def main():

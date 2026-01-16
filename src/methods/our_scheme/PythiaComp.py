@@ -9,11 +9,7 @@ from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple, logging
-
-try:
-    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-except ImportError:  # pragma: no cover - fallback for older HF versions
-    FlashAttentionKwargs = dict  # type: ignore
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from transformers.models.gpt_neox.modeling_gpt_neox import (
     GPTNeoXConfig,

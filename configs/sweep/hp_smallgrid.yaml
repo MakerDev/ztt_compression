@@ -1,0 +1,5 @@
+sweep_name: hp_smallgrid
+parameters:
+  lora_rank: [8, 16, 32]
+  lora_dropout: [0.05, 0.1]
+  cycle_count: [1, 2]
