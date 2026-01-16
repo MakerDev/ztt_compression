@@ -10,7 +10,7 @@ import warnings
 # Import base components
 from .LLaMaComp import (
     LlamaCompConfig, LlamaCompModel, LlamaCompForCausalLM,
-    LoRALayer, LlamaCompDecoderLayer
+    LoRALayer, LlamaCompDecoderLayer,
 )
 
 

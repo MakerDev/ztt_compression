@@ -1,0 +1,17 @@
+name: full
+do_train: true
+do_eval: true
+output_root: runs
+batch_size: 4
+gradient_accumulation_steps: 16
+learning_rate: 2e-4
+num_epochs: 1
+max_seq_length: 1536
+warmup_steps: 50
+logging_steps: 50
+save_steps: 500
+evaluation_strategy: steps
+dataset:
+  name: mmlu_aux
+  text_field: text
+  eval_name: mmlu

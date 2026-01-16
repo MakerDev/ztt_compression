@@ -1,0 +1,17 @@
+name: sanity
+do_train: true
+do_eval: false
+output_root: runs
+batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 2e-4
+num_epochs: 0.1
+max_seq_length: 512
+warmup_steps: 10
+max_steps: 200
+logging_steps: 10
+save_steps: 200
+dataset:
+  name: mmlu_aux
+  subset_ratio: 0.02
+  text_field: text

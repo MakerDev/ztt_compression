@@ -1,0 +1,3 @@
+name: gemma_1b
+model_name: google/gemma-3-1b-it
+tokenizer_name: google/gemma-3-1b-it
